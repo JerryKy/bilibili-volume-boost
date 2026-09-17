@@ -1,0 +1,518 @@
+// ==UserScript==
+// @name         哔哩哔哩 音量增强 (突破 100%)
+// @name:en      Bilibili Volume Boost (over 100%)
+// @namespace    https://github.com/jerry/bilibili-volume-boost
+// @version      2.1.0
+// @description  用 Web Audio 接管播放器音频, 把音量放大到最高 10 倍 (约 +20dB); 禁用时自动直通回原始音量; 控制条集成音量增强按钮
+// @description:en Take over the player audio via Web Audio and amplify volume up to 10x (~+20dB); passthrough when disabled; control-bar button UI.
+// @author       jerry
+// @match        *://www.bilibili.com/*
+// @match        *://www.bilibili.tv/*
+// @run-at       document-idle
+// @license      MIT
+// ==/UserScript==
+
+/* global localStorage */
+
+(() => {
+  'use strict'
+
+  // ================= 配置与常量 =================
+  const MAX_BOOST = 10
+  const CONFIG_KEY = 'bvb-config-v2'
+  const defaultConfig = { enabled: true, boost: 2, limitClipping: true }
+
+  const loadConfig = () => {
+    try {
+      const raw = localStorage.getItem(CONFIG_KEY)
+      if (raw) return { ...defaultConfig, ...JSON.parse(raw) }
+    } catch (e) { /* ignore */ }
+    return { ...defaultConfig }
+  }
+  let config = loadConfig()
+  const saveConfig = () => {
+    try { localStorage.setItem(CONFIG_KEY, JSON.stringify(config)) } catch (e) { /* ignore */ }
+  }
+  const clamp = (n, min, max) => Math.min(Math.max(n, min), max)
+
+  // ================= 播放器定位 (基于实测的 bpx DOM) =================
+  /** 实测结构: #bilibili-player > .bpx-docker > .bpx-player-container
+   *  > .bpx-player-primary-area > .bpx-player-video-area
+   *     ├─ .bpx-player-control-wrap > .bpx-player-control-entity
+   *     │    └─ .bpx-player-control-bottom
+   *     │        ├─ .bpx-player-control-bottom-left   (播放/时间…)
+   *     │        └─ .bpx-player-control-bottom-right  (清晰度/倍速/字幕/音量/设置/…全屏)
+   *     └─ .bpx-player-video-perch > .bpx-player-video-wrap > video
+   */
+  const findPlayer = () => {
+    const container = document.querySelector('.bpx-player-container')
+    if (!container) return null
+    const video = container.querySelector('video')
+    return { container, video: video || null }
+  }
+
+  // ================= 音频接管引擎 =================
+  /**
+   * v2 架构:
+   * - createMediaElementSource 接管后元素音频永久只走 Web Audio 链路, 且禁止二次接管
+   * - 关闭增强 = 直通 (增益 1×, 压限器中性), 绝不因开关关闭 AudioContext
+   * - 链路按 video 元素用 Map 独立管理; 仅元素离开 DOM 时拆除
+   */
+  const AudioContextCtor =
+    window.AudioContext ||
+    (window.webkitAudioContext && window.webkitAudioContext.bind(window)) ||
+    null
+
+  const graphs = new Map()
+  const attachedOnce = new WeakSet()
+  let activeVideo = null
+  let ctxSuspended = false
+
+  const ensureGraph = (video) => {
+    const existing = graphs.get(video)
+    if (existing) return existing
+    if (attachedOnce.has(video)) return null
+    if (!AudioContextCtor) return null
+    try {
+      const ctx = new AudioContextCtor()
+      const source = ctx.createMediaElementSource(video)
+      const gain = ctx.createGain()
+      const limiter = ctx.createDynamicsCompressor()
+      gain.gain.value = 0
+      source.connect(gain)
+      gain.connect(limiter)
+      limiter.connect(ctx.destination)
+      applyLimiterParams(limiter, false)
+
+      const handler = () => applyGain(video)
+      video.addEventListener('volumechange', handler)
+      const graph = { ctx, source, gain, limiter, handler }
+      graphs.set(video, graph)
+      attachedOnce.add(video)
+      if (ctx.state === 'suspended') ctxSuspended = true
+      return graph
+    } catch (e) {
+      console.warn('[volumeBoost] 接管失败:', e)
+      return null
+    }
+  }
+
+  const destroyGraph = (video) => {
+    const g = graphs.get(video)
+    if (!g) return
+    if (g.handler) video.removeEventListener('volumechange', g.handler)
+    const { ctx, source, gain, limiter } = g
+    try { source.disconnect() } catch (e) { /* noop */ }
+    try { gain.disconnect() } catch (e) { /* noop */ }
+    try { limiter.disconnect() } catch (e) { /* noop */ }
+    if (ctx && ctx.state !== 'closed') {
+      void ctx.close().catch(() => undefined)
+    }
+    graphs.delete(video)
+    if (video === activeVideo) activeVideo = null
+  }
+
+  const applyLimiterParams = (limiter, active) => {
+    const t = limiter.context.currentTime
+    if (active) {
+      limiter.threshold.setValueAtTime(-1, t)
+      limiter.knee.setValueAtTime(3, t)
+      limiter.ratio.setValueAtTime(20, t)
+      limiter.attack.setValueAtTime(0.001, t)
+      limiter.release.setValueAtTime(0.15, t)
+    } else {
+      limiter.threshold.setValueAtTime(0, t)
+      limiter.knee.setValueAtTime(0, t)
+      limiter.ratio.setValueAtTime(1, t)
+      limiter.attack.setValueAtTime(0.003, t)
+      limiter.release.setValueAtTime(0.25, t)
+    }
+  }
+
+  const applyGain = (video = activeVideo) => {
+    const g = graphs.get(video)
+    if (!g || !video) return
+    const { enabled, boost, limitClipping } = config
+    const multiplier = enabled ? clamp(boost, 1, MAX_BOOST) : 1
+    const target = video.muted ? 0 : clamp(video.volume * multiplier, 0, MAX_BOOST)
+    applyLimiterParams(g.limiter, enabled && limitClipping && multiplier > 1)
+    g.gain.gain.setTargetAtTime(target, g.ctx.currentTime, 0.03)
+  }
+
+  const resumeContexts = () => {
+    let any = false
+    graphs.forEach((g) => {
+      if (g.ctx.state === 'suspended') {
+        any = true
+        void g.ctx.resume().catch(() => undefined)
+      }
+    })
+    if (!any) ctxSuspended = false
+  }
+
+  // ================= UI (控制条按钮 + 设置面板) =================
+  const ui = { container: null, btn: null, panel: null }
+  let uiControls = null
+
+  const TIP_TEXT = '音量增强 (突破 100%)'
+
+  const SVG_ICON =
+    '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">' +
+    '<path d="M3 9v6h4l5 5V4L7 9H3z"/>' +
+    '<path d="M18.5 7.5h-2v3h-3v2h3v3h2v-3h3v-2h-3z"/>' +
+    '</svg>'
+
+  const PANEL_HTML =
+    '<div class="bvb-head">' +
+    '  <div class="bvb-title">音量增强</div>' +
+    '  <div class="bvb-sub">放大播放器音量, 突破 100% 上限</div>' +
+    '</div>' +
+    '<div class="bvb-row">' +
+    '  <span class="bvb-label">启用增强</span>' +
+    '  <span class="bvb-switch" data-bvb-role="enabled"><input type="checkbox"></span>' +
+    '</div>' +
+    '<div class="bvb-row">' +
+    '  <span class="bvb-label">增益倍率</span>' +
+    '  <span class="bvb-db" data-bvb-role="db"></span>' +
+    '</div>' +
+    '<input type="range" class="bvb-range" min="1" max="10" step="0.5" data-bvb-role="boost">' +
+    '<div class="bvb-hint">最高 10× (≈ +20 dB)。建议 2–4×, 倍率过大请开启削波保护防破音</div>' +
+    '<div class="bvb-row">' +
+    '  <span class="bvb-label">削波保护 (压限)</span>' +
+    '  <span class="bvb-switch" data-bvb-role="limiter"><input type="checkbox"></span>' +
+    '</div>' +
+    '<div class="bvb-status" data-bvb-role="status"></div>'
+
+  const CSS =
+    // 布局完全交给 B 站自己的 .bpx-player-ctrl-btn / .bpx-player-ctrl-btn-icon 规则
+    // (实测: 普通态 36×22 line-height 22px; 网页全屏/全屏 54×43 line-height 32px, 图标 28px)
+    // 这里只负责交互与状态配色, 不覆盖尺寸, 否则全屏态会与其他按钮错位
+    '.bvb-btn{cursor:pointer;user-select:none;position:relative}' +
+    '.bvb-btn:hover,.bvb-btn:hover .bpx-player-ctrl-btn-icon{color:#00aeec}' +
+    '.bvb-btn.bvb-on,.bvb-btn.bvb-on .bpx-player-ctrl-btn-icon{color:#00aeec}' +
+    '.bvb-ico{display:block}' +
+    '.bvb-ico svg{display:block}' +
+    // 悬停提示: 样式来自 BilibiliSponsorBlock(其注释注明灵感源于 the1812/Bilibili-Evolved),
+    // 配色用播放器自己的 CSS 变量, 因此外观始终跟随播放器主题.
+    // 原实现用 translateY(calc(-100% - 36px)) 相对按钮内容流定位(按钮 22px 高图标 → 间距 14px),
+    // 这里改用 left/top 锚点 + 同样的间距(14px → hover 19px), 保证全屏等状态下间距一致.
+    '.bvb-tip{pointer-events:none;font-size:12px;padding:6px 8px;line-height:1.5;white-space:nowrap;' +
+    '  color:var(--bpx-tooltip-color,#fff);background-color:var(--bpx-tooltip-bgcolor,#000);border-radius:4px;' +
+    '  position:absolute;left:50%;top:0;z-index:12000;opacity:0;' +
+    '  transform:translate(-50%,calc(-100% - 14px))}' +
+    '.bvb-btn:hover .bvb-tip{transition:all .2s ease-out .1s;opacity:1;transform:translate(-50%,calc(-100% - 19px))}' +
+    // 面板
+    '.bvb-panel{position:absolute;z-index:99999;width:262px;padding:10px 12px;box-sizing:border-box;' +
+    '  background:rgba(18,20,24,.95);border:1px solid rgba(255,255,255,.08);border-radius:8px;' +
+    '  box-shadow:0 8px 28px rgba(0,0,0,.4);color:#e6e8eb;display:none;' +
+    '  font:12px/1.6 -apple-system,"PingFang SC","Microsoft YaHei",sans-serif;pointer-events:auto}' +
+    '.bvb-panel.open{display:block}' +
+    '.bvb-panel .bvb-head{margin-bottom:6px}' +
+    '.bvb-panel .bvb-title{font-size:13px;font-weight:600;color:#fff}' +
+    '.bvb-panel .bvb-sub{font-size:11px;color:#99a1a8}' +
+    '.bvb-panel .bvb-row{display:flex;align-items:center;justify-content:space-between;padding:5px 0}' +
+    '.bvb-panel .bvb-label{color:#e6e8eb}' +
+    '.bvb-panel .bvb-db{color:#00aeec;font-variant-numeric:tabular-nums;font-weight:600}' +
+    '.bvb-panel .bvb-switch{position:relative;flex:none;width:32px;height:18px;border-radius:9px;background:#4b5158;transition:background .2s;cursor:pointer}' +
+    '.bvb-panel .bvb-switch.checked{background:#00aeec}' +
+    '.bvb-panel .bvb-switch::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:50%;background:#fff;transition:left .2s}' +
+    '.bvb-panel .bvb-switch.checked::after{left:16px}' +
+    '.bvb-panel .bvb-switch input{display:none}' +
+    '.bvb-panel .bvb-range{width:100%;margin:2px 0 0;accent-color:#00aeec;cursor:pointer}' +
+    '.bvb-panel .bvb-row.off .bvb-label,.bvb-panel .bvb-row.off .bvb-db{opacity:.35}' +
+    '.bvb-panel .bvb-range:disabled{opacity:.35;cursor:not-allowed}' +
+    '.bvb-panel .bvb-hint{color:#8a9299;font-size:11px;margin-top:2px;line-height:1.5}' +
+    '.bvb-panel .bvb-status{margin-top:6px;padding-top:6px;border-top:1px solid rgba(255,255,255,.08);color:#99a1a8;font-size:11px}'
+
+  let styleInjected = false
+  const injectStyle = () => {
+    if (styleInjected) return
+    styleInjected = true
+    const style = document.createElement('style')
+    style.textContent = CSS
+    document.head.appendChild(style)
+  }
+
+  let docListenersBound = false
+  const bindDocListeners = () => {
+    if (docListenersBound) return
+    docListenersBound = true
+    document.addEventListener('click', (e) => {
+      const t = e.target
+      if (t && t.closest && !t.closest('.bvb-panel, .bvb-btn')) {
+        if (ui.panel) ui.panel.classList.remove('open')
+      }
+    }, true)
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape' && ui.panel) ui.panel.classList.remove('open')
+    })
+  }
+
+  /**
+   * 找到音量按钮所在的控制条右区; 返回 { row, anchor }
+   * row = .bpx-player-control-bottom-right (按钮们所在 flex 行)
+   * anchor = 音量按钮(插到其后)
+   */
+  const locateControls = (container) => {
+    const row = container.querySelector('.bpx-player-control-bottom-right')
+    if (!row) return null
+    const vol = row.querySelector('.bpx-player-ctrl-volume')
+    return { row, anchor: vol || null }
+  }
+
+  /** 安装按钮 + 面板; 找不到控制条时返回 false(等下次协调) */
+  const ensureUI = () => {
+    const player = findPlayer()
+    const container = player ? player.container : document.querySelector('.bpx-player-container')
+    if (!container) return false
+
+    const spot = locateControls(container)
+    if (!spot) return false // 控制条还没挂载, 心跳重试
+
+    // 已就位且位置正确 → 跳过
+    if (ui.btn && ui.btn.isConnected && spot.row.contains(ui.btn)) return true
+
+    // 重建: 移除旧节点(若还挂在别处)
+    if (ui.btn) { try { ui.btn.remove() } catch (e) { /* noop */ } }
+    if (ui.panel) { try { ui.panel.remove() } catch (e) { /* noop */ } }
+    ui.container = null; ui.btn = null; ui.panel = null; uiControls = null
+
+    injectStyle()
+    ui.container = container
+
+    // ---- 按钮: 插入到音量按钮之后, 结构/类名与原生按钮保持一致 ----
+    const btn = document.createElement('div')
+    btn.className = 'bpx-player-ctrl-btn bvb-btn'
+    // 原生按钮用 aria-label 提供文字(无 title, 避免浏览器原生提示), 这里保持一致
+    btn.setAttribute('role', 'button')
+    btn.setAttribute('aria-label', TIP_TEXT)
+    btn.setAttribute('tabindex', '0')
+    // 图标 + 悬停提示(提示紧跟在图标后, 由 .bvb-btn:hover 控制显隐)
+    btn.innerHTML =
+      '<div class="bpx-player-ctrl-btn-icon bvb-ico">' + SVG_ICON + '</div>' +
+      '<div class="bvb-tip">' + TIP_TEXT + '</div>'
+    if (spot.anchor && spot.anchor.nextSibling) {
+      spot.row.insertBefore(btn, spot.anchor.nextSibling)
+    } else {
+      spot.row.appendChild(btn)
+    }
+    ui.btn = btn
+
+    // ---- 面板: 挂在播放器容器上(overflow 可见, position relative) ----
+    const panel = document.createElement('div')
+    panel.className = 'bvb-panel'
+    panel.innerHTML = PANEL_HTML
+    container.appendChild(panel)
+    ui.panel = panel
+
+    const role = (name) => panel.querySelector('[data-bvb-role="' + name + '"]')
+    const enabledSwitch = role('enabled').querySelector('input')
+    const limiterSwitch = role('limiter').querySelector('input')
+    const boostSlider = role('boost')
+    const boostRow = boostSlider.previousElementSibling
+    uiControls = {
+      enabledSwitch, limiterSwitch, boostSlider, boostRow,
+      dbEl: role('db'),
+      statusEl: role('status'),
+    }
+
+    const syncUI = () => {
+      role('enabled').classList.toggle('checked', config.enabled)
+      role('limiter').classList.toggle('checked', config.limitClipping)
+      boostSlider.value = String(config.boost)
+      boostSlider.disabled = !config.enabled
+      const db = 20 * Math.log10(Math.max(config.boost, 1))
+      uiControls.dbEl.textContent = config.boost + '×  (+' + db.toFixed(1) + ' dB)'
+      boostRow.classList.toggle('off', !config.enabled)
+      btn.classList.toggle('bvb-on', config.enabled && config.boost > 1)
+    }
+    syncUI()
+
+    enabledSwitch.addEventListener('change', () => {
+      config.enabled = enabledSwitch.checked
+      saveConfig(); syncUI(); refreshStatus()
+      if (activeVideo) applyGain(activeVideo)
+    })
+    limiterSwitch.addEventListener('change', () => {
+      config.limitClipping = limiterSwitch.checked
+      saveConfig(); syncUI()
+      if (activeVideo) applyGain(activeVideo)
+    })
+    boostSlider.addEventListener('input', () => {
+      config.boost = parseFloat(boostSlider.value) || 1
+      saveConfig(); syncUI()
+      if (activeVideo) applyGain(activeVideo)
+    })
+    ;['enabled', 'limiter'].forEach((name) => {
+      const sw = role(name)
+      sw.addEventListener('click', () => {
+        const inp = sw.querySelector('input')
+        inp.checked = !inp.checked
+        inp.dispatchEvent(new Event('change'))
+      })
+    })
+
+    bindDocListeners()
+    btn.addEventListener('click', (e) => {
+      e.preventDefault()
+      e.stopPropagation()
+      const open = panel.classList.toggle('open')
+      if (open) {
+        positionPanel()
+        refreshStatus()
+      }
+    })
+    return true
+  }
+
+  const positionPanel = () => {
+    const { panel, btn, container } = ui
+    if (!panel || !btn || !container) return
+    const panelW = 286
+    const cr = container.getBoundingClientRect()
+    const br = btn.getBoundingClientRect()
+    const entity = container.querySelector('.bpx-player-control-entity')
+    const er = entity ? entity.getBoundingClientRect() : null
+    // 面板底部 = 控制条顶部上方 8px; 右侧对齐按钮
+    const bottom = er ? (cr.bottom - er.top) + 8 : Math.max(8, cr.bottom - br.top + 8)
+    const left = clamp((br.right - cr.left) - panelW, 8, Math.max(8, cr.width - panelW - 8))
+    panel.style.left = left + 'px'
+    panel.style.bottom = bottom + 'px'
+  }
+
+  /**
+   * 运行时镜像原生按钮的图标几何:
+   * B 站按钮在不同状态尺寸不同 (普通 36×22/图标22, 网页全屏与全屏 54×43/图标32+svg28),
+   * 且靠 "块级 + line-height" 对齐而非 flex 居中. 这里直接读取同行原生按钮的实测值套用,
+   * 任何状态下都能与相邻按钮精确对齐 (只需在状态切换/换容器后调用一次).
+   */
+  const syncIconMetrics = () => {
+    const btn = ui.btn
+    if (!btn || !btn.isConnected) return
+    const row = btn.parentElement
+    if (!row) return
+    const myIcon = btn.querySelector('.bvb-ico')
+    const mySvg = myIcon && myIcon.querySelector('svg')
+    if (!myIcon || !mySvg) return
+    // 取同行原生按钮作参照 (设置按钮结构最稳定)
+    const refIcon = row.querySelector('.bpx-player-ctrl-setting .bpx-player-ctrl-btn-icon') ||
+      row.querySelector('.bpx-player-ctrl-btn-icon')
+    if (!refIcon) return
+    const refSvg = refIcon.querySelector('svg')
+    const ics = getComputedStyle(refIcon)
+    myIcon.style.width = ics.width
+    myIcon.style.height = ics.height
+    myIcon.style.lineHeight = ics.lineHeight
+    if (refSvg) {
+      const scs = getComputedStyle(refSvg)
+      mySvg.style.width = scs.width
+      mySvg.style.height = scs.height
+      // 原生 svg 相对图标块的垂直偏移(部分状态非 0), 精确复刻
+      const offset = refSvg.getBoundingClientRect().top - refIcon.getBoundingClientRect().top
+      mySvg.style.marginTop = offset + 'px'
+    }
+  }
+
+  const refreshStatus = () => {
+    if (!uiControls || !ui.panel.classList.contains('open')) return
+    const s = uiControls.statusEl
+    const graph = graphs.get(activeVideo)
+    const boosting = config.enabled && config.boost > 1
+    if (!activeVideo) {
+      s.textContent = '等待播放器…'
+    } else if (!AudioContextCtor) {
+      s.textContent = '当前浏览器不支持 Web Audio, 无法放大'
+    } else if (!graph) {
+      s.textContent = config.enabled ? '未接管 (可能已切换视频)' : '已关闭, 播放器为原始音量'
+    } else if (ctxSuspended || graph.ctx.state === 'suspended') {
+      s.textContent = boosting
+        ? '已接管, 点击播放器后生效 (浏览器自动播放限制)'
+        : '直通中, 与原生音量一致'
+    } else {
+      s.textContent = boosting
+        ? '已接管: 音量 0–100% × ' + config.boost + '×'
+        : '直通中: 与原生音量一致'
+    }
+  }
+
+  // ================= 协调 (低频, 避免干扰播放器) =================
+  let reconcileTimer = null
+  const reconcile = (reason) => {
+    if (reconcileTimer) return // 合并心跳+观察器触发
+    reconcileTimer = setTimeout(() => {
+      reconcileTimer = null
+      const player = findPlayer()
+      const video = player ? player.video : null
+
+      // 清理已离开 DOM 的元素链路
+      graphs.forEach((g, el) => {
+        if (!el.isConnected) destroyGraph(el)
+      })
+
+      if (!video) {
+        activeVideo = null
+        if (player) { ensureUI(); syncIconMetrics() } // 容器在但还没 video: 仍尝试装按钮
+        refreshStatus()
+        return
+      }
+
+      activeVideo = video
+      ensureUI()
+      syncIconMetrics()
+      refreshStatus()
+
+      if (config.enabled && !graphs.has(video)) {
+        if (ensureGraph(video)) applyGain(video)
+      }
+      applyGain(video)
+    }, 120)
+  }
+
+  // ================= 启动 =================
+  const start = () => {
+    // 只观察两个低变更区: video 所在区域(换源/换清晰度时元素替换) 与控制条右区(挂载)
+    let perchObserved = null
+    const onVideoAreaChange = () => reconcile('video-area')
+    const perchObserver = new MutationObserver(onVideoAreaChange)
+    const tryObserve = () => {
+      const perch = document.querySelector('.bpx-player-video-perch')
+      if (perch && perch !== perchObserved) {
+        if (perchObserved) perchObserver.disconnect()
+        perchObserver.observe(perch, { childList: true, subtree: true })
+        perchObserved = perch
+      }
+      const cont = document.querySelector('.bpx-player-container')
+      if (cont && !cont.__bvbListened) {
+        // SPA 整页重建 + 播放模式切换(网页全屏/全屏会改容器 class) 检测
+        try { Object.defineProperty(cont, '__bvbListened', { value: true, configurable: true }) } catch (e) { /* noop */ }
+        new MutationObserver(() => reconcile('container-state')).observe(cont, {
+          childList: true,
+          attributes: true,
+          attributeFilter: ['class'],
+        })
+      }
+    }
+    tryObserve()
+
+    // 全屏/窗口尺寸变化 → 立即镜像图标几何(各状态按钮尺寸不同)
+    document.addEventListener('fullscreenchange', () => reconcile('fullscreen'))
+    window.addEventListener('resize', () => reconcile('resize'))
+
+    // 兜底心跳: 2s, 覆盖控制条晚挂载 / SPA 导航后容器重建
+    setInterval(() => {
+      if (document.hidden) return
+      tryObserve()
+      reconcile('heartbeat')
+    }, 2000)
+
+    document.addEventListener('pointerdown', resumeContexts, true)
+    document.addEventListener('keydown', resumeContexts, true)
+    reconcile('init')
+  }
+
+  if (document.readyState === 'loading') {
+    window.addEventListener('DOMContentLoaded', start, { once: true })
+  } else {
+    start()
+  }
+})()
