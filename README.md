@@ -45,7 +45,8 @@ v2 改为**直通模式**：
 
 - 关闭增强 ≠ 拆除链路，而是把增益回到 `1×`、压限器参数置中性（0 dB 阈值 + 1:1 压缩 =
   完全透明），声音连续、无中断、无需重建
-- AudioContext **永不因开关而关闭**，只有 video 元素被播放器销毁（离开 DOM）时才拆除
+- AudioContext **永不因开关而关闭**；只有 video 元素被播放器销毁（离开 DOM 且超过 20s 宽限期）
+  才拆除——`createMediaElementSource` 是一次性的，元素被挪走又放回来时绝不能拆，否则永久静音
 - 同一元素只接管一次；链路按元素独立管理，播放器轮换/重建元素互不干扰
 
 ## 限制
@@ -58,6 +59,38 @@ v2 改为**直通模式**：
 
 ## 版本记录
 
+- **2.1.1**：一次代码审查（找死代码 + 收敛）后的修复与简化，交互与外观不放宽、只修错和去掉冗余。
+  - **修复｜面板开关首次点击被"吃掉"**：`syncUI()` 只同步了 `.bvb-switch` 的 class（视觉态），
+    没同步内部 `<input>.checked`（点击处理读的才是它）。默认为 `true` 的「启用增强」「削波保护」
+    新建面板后 input 实际是 unchecked，第一次点击只是把它补回 true —— 等于空点一下。
+    实测（headless）：首次点击后配置仍是 `enabled:true`、增益不变；修复后首次点击即生效。
+  - **修复｜面板横向偏左 24px**：`positionPanel()` 硬编码 `panelW = 286`，而 CSS 实际宽度是
+    262px（`box-sizing:border-box`）。改为直接读 `panel.offsetWidth`，以后改 CSS 不会再不同步。
+    实测：面板右边缘与按钮右边缘偏差 `-24px → 0`。
+  - **修复｜接管失败时泄漏 AudioContext**：`new AudioContext()` 成功、`createMediaElementSource()`
+    抛异常时上下文没关闭，而 2s 心跳会反复重试 → 每次泄漏一个上下文并刷一条警告。
+    现在失败即关闭，并把该元素记入"已处理"不再重试。
+  - **修复｜配置被写坏会让脚本半瘫**：`boost: "abc"` 时 `clamp()` 返回 NaN，
+    `setTargetAtTime(NaN)` 抛 `TypeError: The provided float value is non-finite`，此后增益更新全部中断
+    （面板显示 `abc×  (+NaN dB)`）。新增 `normalizeConfig()`，读入即收敛到合法区间。
+  - **健壮性｜链路回收加 20s 宽限期**：原实现 video 一离开 DOM 就 `close()` 上下文，而接管不可重做，
+    元素被挪走又放回来就永久静音。实测（摘掉 video 3s 再插回）：旧实现上下文 `closed`，
+    新实现仍存活可用，超过宽限期没回来才回收。
+  - **健壮性｜容器观察器改用 `WeakSet`**：不再给 DOM 挂 `__bvbListened` expando
+    （`defineProperty` 一旦失败守卫就失效，每次心跳会重复挂一个 MutationObserver）。
+  - **性能｜滑块拖动不再每帧落盘**：拖动期间每个 `input` 事件都写 localStorage（一次拖动几十次同步写入），
+    改为松手（`change`）落盘；同时拖动时状态行文案会同步刷新（原来不刷新）。
+  - **性能｜图标几何镜像不再跟心跳跑**：该操作用 `getComputedStyle` + `getBoundingClientRect`（强制布局），
+    只在 UI 重建 / fullscreenchange / resize / 容器 class 变化时执行，2s 心跳跳过。
+  - **死代码清理**：`ensureUI()` 里恒为 null 的容器兜底查询；紧跟无条件 `applyGain()` 的重复 `applyGain()`；
+    `applyGain()` 里重复的判空；`ctxSuspended` 全局标志（`refreshStatus()` 本来就只看当前 graph 的
+    `ctx.state`，该标志只会让文案显示过期状态）；`locateControls()` 的 `vol || null`；
+    `syncIconMetrics()` 兜底选择器可能选中自己的图标（补 `:not(.bvb-ico)`）；
+    滑块的 `max="10"` 与提示文案改为引用 `MAX_BOOST`。
+  - **实测回归（headless + CDP，改动前后同一套探针）**：增益数值全部符合预期
+    （volume 1×2× → 2.0；0.3×2× → 0.6；静音 → 0；关闭增强 → 0.3 且压限中性 `th=0/ratio=1`；
+    启用 + 5.5×、volume 0.3 → 1.65；volume 1×5.5× → 5.5）；按钮/图标与相邻原生按钮中心偏差仍为 0、
+    悬停提示间距仍为 14px、面板底部与控制条间距仍为 8px。
 - **2.1.0**：按需求**只保留 BilibiliSponsorBlock 的实现方式**，移除其它所有方案。
   - 删除了：播放器官方 tooltip API 直连、页面桥接（postMessage 代调）、"官方失败才自绘"的兜底逻辑，
     以及为访问页面全局而加的 `@grant unsafeWindow` 与页面窗口解析器（`localStorage` / `AudioContext`
