@@ -2,7 +2,7 @@
 // @name         哔哩哔哩 音量增强 (突破 100%)
 // @name:en      Bilibili Volume Boost (over 100%)
 // @namespace    https://github.com/jerry/bilibili-volume-boost
-// @version      2.1.1
+// @version      0.1.0
 // @description  用 Web Audio 接管播放器音频, 把音量放大到最高 10 倍 (约 +20dB); 禁用时自动直通回原始音量; 控制条集成音量增强按钮
 // @description:en Take over the player audio via Web Audio and amplify volume up to 10x (~+20dB); passthrough when disabled; control-bar button UI.
 // @author       jerry
@@ -176,7 +176,23 @@
   const ui = { container: null, btn: null, panel: null }
   let uiControls = null
 
-  const TIP_TEXT = '音量增强 (突破 100%)'
+  /** 悬停开合的"收起"延时器。
+   *  面板在控制条上方 8px, 鼠标从按钮斜穿进面板会先经过这段空隙 → 先触发按钮的 mouseleave。
+   *  所以离开时不立刻收起, 留一小段宽限给"正要挪进面板"的指针; 进入面板即取消。 */
+  let panelHideTimer = null
+  const PANEL_HIDE_DELAY = 180
+
+  const cancelPanelHide = () => {
+    if (panelHideTimer) { clearTimeout(panelHideTimer); panelHideTimer = null }
+  }
+
+  const closePanel = () => {
+    cancelPanelHide()
+    if (ui.panel) ui.panel.classList.remove('open')
+  }
+
+  // 只用于无障碍标签(原生按钮也是这样提供文字, 不用 title, 免得冒出浏览器原生提示)
+  const BTN_LABEL = '音量增强 (突破 100%)'
 
   const SVG_ICON =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">' +
@@ -210,20 +226,11 @@
     // 布局完全交给 B 站自己的 .bpx-player-ctrl-btn / .bpx-player-ctrl-btn-icon 规则
     // (实测: 普通态 36×22 line-height 22px; 网页全屏/全屏 54×43 line-height 32px, 图标 28px)
     // 这里只负责交互与状态配色, 不覆盖尺寸, 否则全屏态会与其他按钮错位
-    '.bvb-btn{cursor:pointer;user-select:none;position:relative}' +
+    '.bvb-btn{cursor:pointer;user-select:none}' +
     '.bvb-btn:hover,.bvb-btn:hover .bpx-player-ctrl-btn-icon{color:#00aeec}' +
     '.bvb-btn.bvb-on,.bvb-btn.bvb-on .bpx-player-ctrl-btn-icon{color:#00aeec}' +
     '.bvb-ico{display:block}' +
     '.bvb-ico svg{display:block}' +
-    // 悬停提示: 样式来自 BilibiliSponsorBlock(其注释注明灵感源于 the1812/Bilibili-Evolved),
-    // 配色用播放器自己的 CSS 变量, 因此外观始终跟随播放器主题.
-    // 原实现用 translateY(calc(-100% - 36px)) 相对按钮内容流定位(按钮 22px 高图标 → 间距 14px),
-    // 这里改用 left/top 锚点 + 同样的间距(14px → hover 19px), 保证全屏等状态下间距一致.
-    '.bvb-tip{pointer-events:none;font-size:12px;padding:6px 8px;line-height:1.5;white-space:nowrap;' +
-    '  color:var(--bpx-tooltip-color,#fff);background-color:var(--bpx-tooltip-bgcolor,#000);border-radius:4px;' +
-    '  position:absolute;left:50%;top:0;z-index:12000;opacity:0;' +
-    '  transform:translate(-50%,calc(-100% - 14px))}' +
-    '.bvb-btn:hover .bvb-tip{transition:all .2s ease-out .1s;opacity:1;transform:translate(-50%,calc(-100% - 19px))}' +
     // 面板
     '.bvb-panel{position:absolute;z-index:99999;width:262px;padding:10px 12px;box-sizing:border-box;' +
     '  background:rgba(18,20,24,.95);border:1px solid rgba(255,255,255,.08);border-radius:8px;' +
@@ -263,22 +270,29 @@
     document.addEventListener('click', (e) => {
       const t = e.target
       if (t && t.closest && !t.closest('.bvb-panel, .bvb-btn')) {
-        if (ui.panel) ui.panel.classList.remove('open')
+        closePanel()
       }
     }, true)
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape' && ui.panel) ui.panel.classList.remove('open')
+      if (e.key === 'Escape') closePanel()
     })
   }
 
   /**
-   * 找到音量按钮所在的控制条右区; 返回 { row, anchor }
+   * 找到音量按钮所在的控制条右区; 返回 { row, anchor }, 还没到可插入的时机则返回 null
    * row = .bpx-player-control-bottom-right (按钮们所在 flex 行)
-   * anchor = 音量按钮(插到其后, 没有就退化为追加到行尾)
+   * anchor = 音量按钮(插到其后; 找不到时退化为追加到行尾)
+   *
+   * 为什么要多判一步"行里有没有原生按钮": 播放器搭建控制条时, 这个 flex 行会先于按钮出现。
+   * 此时 anchor 为 null → 走追加分支, 我们的按钮就成了行里唯一的(也是第一个)子元素, 之后
+   * 原生按钮陆续追加在它后面 —— 于是按钮永久停在最左端(实测还被 flex 撑到 978×16), 而
+   * ensureUI() 之后会判定"已就位"不再校正。所以这种中间态按 pending 处理, 等下一次协调;
+   * 只有"行里已有原生按钮、但确实没有音量按钮"时才走追加到行尾的兜底。
    */
   const locateControls = (container) => {
     const row = container.querySelector('.bpx-player-control-bottom-right')
     if (!row) return null
+    if (!row.querySelector('.bpx-player-ctrl-btn:not(.bvb-btn)')) return null // 控制条还在搭, 等下一轮
     return { row, anchor: row.querySelector('.bpx-player-ctrl-volume') }
   }
 
@@ -297,7 +311,8 @@
       return 'ready'
     }
 
-    // 重建: 移除旧节点(若还挂在别处)
+    // 重建: 移除旧节点(若还挂在别处); 旧面板的收起定时器一并作废, 否则会去操作已移除的节点
+    cancelPanelHide()
     if (ui.btn) { try { ui.btn.remove() } catch (e) { /* noop */ } }
     if (ui.panel) { try { ui.panel.remove() } catch (e) { /* noop */ } }
     ui.container = null; ui.btn = null; ui.panel = null; uiControls = null
@@ -310,12 +325,10 @@
     btn.className = 'bpx-player-ctrl-btn bvb-btn'
     // 原生按钮用 aria-label 提供文字(无 title, 避免浏览器原生提示), 这里保持一致
     btn.setAttribute('role', 'button')
-    btn.setAttribute('aria-label', TIP_TEXT)
+    btn.setAttribute('aria-label', BTN_LABEL)
     btn.setAttribute('tabindex', '0')
-    // 图标 + 悬停提示(提示紧跟在图标后, 由 .bvb-btn:hover 控制显隐)
     btn.innerHTML =
-      '<div class="bpx-player-ctrl-btn-icon bvb-ico">' + SVG_ICON + '</div>' +
-      '<div class="bvb-tip">' + TIP_TEXT + '</div>'
+      '<div class="bpx-player-ctrl-btn-icon bvb-ico">' + SVG_ICON + '</div>'
     if (spot.anchor && spot.anchor.nextSibling) {
       spot.row.insertBefore(btn, spot.anchor.nextSibling)
     } else {
@@ -383,16 +396,37 @@
       })
     })
 
-    bindDocListeners()
+    // ---- 开合交互: 鼠标划过图标即展开, 指针离开图标/面板即收起 ----
+    const openPanel = () => {
+      cancelPanelHide()
+      if (!panel.classList.contains('open')) {
+        panel.classList.add('open')
+        positionPanel() // 必须等 display 生效后再量, 隐藏态 offsetWidth 为 0
+      }
+      refreshStatus()
+    }
+    const scheduleClose = () => {
+      cancelPanelHide()
+      panelHideTimer = setTimeout(() => { panelHideTimer = null; closePanel() }, PANEL_HIDE_DELAY)
+    }
+
+    btn.addEventListener('mouseenter', openPanel)
+    btn.addEventListener('mouseleave', scheduleClose)
+    // 指针进面板(开关/滑块)即取消收起, 离开面板才收起
+    panel.addEventListener('mouseenter', cancelPanelHide)
+    panel.addEventListener('mouseleave', scheduleClose)
+    // 拖动滑块时指针可能滑出面板, 按下期间不收起
+    panel.addEventListener('pointerdown', cancelPanelHide)
+
+    // 触屏 / 键盘没有 hover: 点击与聚焦仍可展开; 点空白处或 Esc 收起
     btn.addEventListener('click', (e) => {
       e.preventDefault()
       e.stopPropagation()
-      const open = panel.classList.toggle('open')
-      if (open) {
-        positionPanel()
-        refreshStatus()
-      }
+      openPanel()
     })
+    btn.addEventListener('focus', openPanel)
+
+    bindDocListeners()
     return 'rebuilt'
   }
 
