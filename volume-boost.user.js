@@ -1,6 +1,6 @@
 // ==UserScript==
-// @name         哔哩哔哩 音量增强 (突破 100%)
-// @name:en      Bilibili Volume Boost (over 100%)
+// @name         哔哩哔哩 音量增强
+// @name:en      Bilibili Volume Boost
 // @namespace    https://github.com/jerry/bilibili-volume-boost
 // @version      0.1.0
 // @description  用 Web Audio 接管播放器音频, 把音量放大到最高 10 倍 (约 +20dB); 禁用时自动直通回原始音量; 控制条集成音量增强按钮
@@ -192,7 +192,7 @@
   }
 
   // 只用于无障碍标签(原生按钮也是这样提供文字, 不用 title, 免得冒出浏览器原生提示)
-  const BTN_LABEL = '音量增强 (突破 100%)'
+  const BTN_LABEL = '音量增强'
 
   const SVG_ICON =
     '<svg viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">' +
@@ -203,7 +203,7 @@
   const PANEL_HTML =
     '<div class="bvb-head">' +
     '  <div class="bvb-title">音量增强</div>' +
-    '  <div class="bvb-sub">放大播放器音量, 突破 100% 上限</div>' +
+    '  <div class="bvb-sub">声微饭否？</div>' +
     '</div>' +
     '<div class="bvb-row">' +
     '  <span class="bvb-label">启用增强</span>' +
