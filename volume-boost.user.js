@@ -2,7 +2,7 @@
 // @name         哔哩哔哩 音量增强
 // @name:en      Bilibili Volume Boost
 // @namespace    https://github.com/jerry/bilibili-volume-boost
-// @version      0.1.0
+// @version      0.1.1
 // @description  用 Web Audio 接管播放器音频, 把音量放大到最高 10 倍 (约 +20dB); 禁用时自动直通回原始音量; 控制条集成音量增强按钮
 // @description:en Take over the player audio via Web Audio and amplify volume up to 10x (~+20dB); passthrough when disabled; control-bar button UI.
 // @author       jerry
@@ -448,10 +448,33 @@
   }
 
   /**
+   * 参考图标的尺寸监视器。
+   * 为什么不能只靠容器观察器: 网页全屏的状态类是加在 <body> 上的 (body.webscreen-fix),
+   * 不在 .bpx-player-container 上 —— 实测用 el.click() 程序化进入网页全屏时容器 class 一个都没变,
+   * 于是 reconcile 不会触发, 按钮一直保持普通态的 36×22, 而原生按钮已经变成 54×32:
+   * 这就是"网页全屏后图标错位"的根因 (之前能对上, 是因为鼠标移动顺带改了容器上的 cursor 类)。
+   * ResizeObserver 直接盯参考图标自己的盒子, 不关心状态类挂在哪一层。
+   */
+  let iconObserver = null
+  let observedRefIcon = null
+  const observeRefIcon = (refIcon) => {
+    if (typeof ResizeObserver !== 'function' || observedRefIcon === refIcon) return
+    if (!iconObserver) iconObserver = new ResizeObserver(() => syncIconMetrics())
+    if (observedRefIcon) { try { iconObserver.unobserve(observedRefIcon) } catch (e) { /* noop */ } }
+    observedRefIcon = refIcon
+    try { iconObserver.observe(refIcon) } catch (e) { /* noop */ }
+  }
+
+  /** 只在值真的变了才写, 避免无谓的样式重算 */
+  const setStyle = (el, prop, value) => {
+    if (el.style[prop] !== value) el.style[prop] = value
+  }
+
+  /**
    * 运行时镜像原生按钮的图标几何:
    * B 站按钮在不同状态尺寸不同 (普通 36×22/图标22, 网页全屏与全屏 54×43/图标32+svg28),
    * 且靠 "块级 + line-height" 对齐而非 flex 居中. 这里直接读取同行原生按钮的实测值套用,
-   * 任何状态下都能与相邻按钮精确对齐 (只需在状态切换/换容器后调用一次).
+   * 任何状态下都能与相邻按钮精确对齐.
    */
   const syncIconMetrics = () => {
     const btn = ui.btn
@@ -465,18 +488,25 @@
     const refIcon = row.querySelector('.bpx-player-ctrl-setting .bpx-player-ctrl-btn-icon') ||
       row.querySelector('.bpx-player-ctrl-btn-icon:not(.bvb-ico)')
     if (!refIcon) return
+    observeRefIcon(refIcon)
     const refSvg = refIcon.querySelector('svg')
     const ics = getComputedStyle(refIcon)
-    myIcon.style.width = ics.width
-    myIcon.style.height = ics.height
-    myIcon.style.lineHeight = ics.lineHeight
+    // 整行被隐藏时尺寸会量到 0, 别把 0 写进去
+    if (parseFloat(ics.width) <= 0 || parseFloat(ics.height) <= 0) return
+    setStyle(myIcon, 'width', ics.width)
+    setStyle(myIcon, 'height', ics.height)
+    setStyle(myIcon, 'lineHeight', ics.lineHeight)
     if (refSvg) {
       const scs = getComputedStyle(refSvg)
-      mySvg.style.width = scs.width
-      mySvg.style.height = scs.height
-      // 原生 svg 相对图标块的垂直偏移(部分状态非 0), 精确复刻
+      setStyle(mySvg, 'width', scs.width)
+      setStyle(mySvg, 'height', scs.height)
+      // 原生 svg 相对图标块的垂直偏移(部分状态非 0), 精确复刻.
+      // 必须用 relative + top: 用 margin-top 会与父块发生外边距塌陷, 把整个图标块一起推下去 2px
+      // (实测网页全屏: 图标块 top 849 vs 原生 847, svg 虽对齐但热区/背景偏下).
       const offset = refSvg.getBoundingClientRect().top - refIcon.getBoundingClientRect().top
-      mySvg.style.marginTop = offset + 'px'
+      setStyle(mySvg, 'marginTop', '')
+      setStyle(mySvg, 'position', 'relative')
+      setStyle(mySvg, 'top', offset + 'px')
     }
   }
 
