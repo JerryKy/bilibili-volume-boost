@@ -1,11 +1,11 @@
 // ==UserScript==
 // @name         哔哩哔哩 音量增强
 // @name:en      Bilibili Volume Boost
-// @namespace    https://github.com/jerry/bilibili-volume-boost
+// @namespace    https://github.com/JerryKy/bilibili-volume-boost
 // @version      0.1.1
 // @description  用 Web Audio 接管播放器音频, 把音量放大到最高 10 倍 (约 +20dB); 禁用时自动直通回原始音量; 控制条集成音量增强按钮
 // @description:en Take over the player audio via Web Audio and amplify volume up to 10x (~+20dB); passthrough when disabled; control-bar button UI.
-// @author       jerry
+// @author       JerryKy
 // @match        *://www.bilibili.com/*
 // @match        *://www.bilibili.tv/*
 // @run-at       document-idle

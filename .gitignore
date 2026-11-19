@@ -1,0 +1,8 @@
+# macOS
+.DS_Store
+
+# 日志
+*.log
+
+# 依赖（本项目无构建步骤，留作兜底）
+node_modules/
